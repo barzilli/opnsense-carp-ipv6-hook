@@ -23,6 +23,18 @@ The hook expects the pair to be set up as follows. Items 1 to 5 come from the te
 8. **LAN IPv6 set to track WAN (identity association) on the MASTER, and to SLAAC on the BACKUP.** The hook switches it at each transition.
 9. **The settings block matches each node:** `WAN_KEY`, `WAN_IF`, `LAN_KEY`, `LAN_IF`, `LAN_GW6`.
 
+## Other ISPs
+
+The hook has only been tested with AT&T fiber, which delegates /64s out of a /60. The script itself doesn't depend on the ISP: it only switches WAN, LAN tracking and the floating gateways. What changes between ISPs is how their DHCPv6 server reacts when a second router takes over the same lease. Before relying on it with another ISP, check these, which are general guidance and not yet tested:
+
+- **MAC locking.** Cable ISPs such as Spectrum usually have the modem learn the first MAC address it sees and serve only that until the modem reboots. That makes the shared WAN MAC (item 1) essential, not just helpful.
+- **Lease binding.** Most ISPs tie the delegated prefix to the DUID and IAID, so keep both identical on the two nodes (items 2 and 3) to get the same prefix after a failover.
+- **Release on WAN down.** If the old master sends a DHCPv6 RELEASE when the hook takes WAN down, some ISPs hand the new master a different prefix. Consider enabling "Do not allow PD/Address release" on WAN.
+- **Prefix size.** Set the requested prefix-delegation size to what the ISP actually delegates (Spectrum commonly gives a /64, sometimes a /56 on request). The hook tracks with prefix ID 0, which works for either size.
+- **Prefix-only leases.** If the ISP delegates a prefix but no WAN address, tick "Request only an IPv6 prefix". Otherwise OPNsense may not reconfigure the tracking LAN ([opnsense/core#7202](https://github.com/opnsense/core/issues/7202)).
+
+After switching ISPs, run a failover and failback and confirm that LAN keeps the same prefix, that `ndp -p` shows `LO` (no `A`) for it on the master, and that the BACKUP has IPv4 and IPv6 default routes.
+
 ## Fix: LAN /64 route lost after failback
 
 While a node is BACKUP, vtnet0 accepts RAs and learns the LAN prefix from the master with the autonomous (A) flag set. When the node returns to MASTER, the hook used to turn `accept_rtadv` off but left that RA-learned prefix in place. The address that dhcp6c then added reused it, so the A flag stuck. FreeBSD then detaches A-flagged prefixes that have no reachable advertising router as soon as the WAN router is seen as reachable ([nd6_rtr.c](https://github.com/freebsd/freebsd-src/blob/stable/14/sys/netinet6/nd6_rtr.c#L1846-L1855)). That removed the LAN /64 route, and traffic for LAN hosts looped between the firewall and the upstream gateway.
