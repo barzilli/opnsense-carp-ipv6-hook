@@ -1,0 +1,236 @@
+#!/usr/local/bin/php
+<?php
+
+/*
+ * CARP syshook for an OPNsense HA pair.
+ *
+ *   MASTER         -> WAN up, LAN IPv6 tracks WAN (identity association),
+ *                     floating LAN IPv6 gateway disabled.
+ *   BACKUP / INIT  -> WAN down, LAN IPv6 back to SLAAC,
+ *                     floating LAN IPv6 gateway enabled (default route via the master).
+ *
+ * Install as /usr/local/etc/rc.syshook.d/carp/80-wancarp on both nodes (chmod +x).
+ * Invoked by OPNsense as:  80-wancarp <vhid>@<ifname> <MASTER|BACKUP|INIT>
+ */
+
+require_once("config.inc");
+require_once("system.inc");
+require_once("interfaces.inc");
+require_once("interfaces.lib.inc");
+require_once("util.inc");
+
+/* ------------------------------ settings ------------------------------ */
+
+const WAN_KEY    = 'wan';      // interface brought up/down
+const WAN_IF     = 'vtnet1';
+const LAN_KEY    = 'lan';      // interface carrying the CARP VIP
+const LAN_IF     = 'vtnet0';
+const LAN_GW6    = 'LAN_6';    // floating IPv6 gateway used while BACKUP
+const LOCK_FILE  = '/tmp/wancarp.lock';
+
+/* ------------------------------ helpers ------------------------------- */
+
+function say(string $msg): void
+{
+    log_msg('wancarp: ' . $msg);
+}
+
+/** Run a shell command; log output if it fails. */
+function run_cmd(string $cmd): bool
+{
+    $output = [];
+    exec($cmd . ' 2>&1', $output, $ret);
+    if ($ret !== 0) {
+        log_error(sprintf("wancarp: '%s' failed (exit %d): %s", $cmd, $ret, implode(' ', $output)));
+        return false;
+    }
+    return true;
+}
+
+function ifconfig(string $ifname, string $args): bool
+{
+    return run_cmd('/sbin/ifconfig ' . escapeshellarg($ifname) . ' ' . $args);
+}
+
+/** Remove every fe80:: address from an interface. */
+function remove_link_local(string $ifname): void
+{
+    $output = [];
+    exec('/sbin/ifconfig ' . escapeshellarg($ifname) . ' inet6 2>&1', $output);
+    foreach ($output as $line) {
+        if (preg_match('/^\s*inet6\s+(fe80:[0-9a-f:]*%\S+)/i', $line, $m)) {
+            ifconfig($ifname, 'inet6 ' . escapeshellarg($m[1]) . ' -alias');
+        }
+    }
+}
+
+/**
+ * Drop the SLAAC state an interface picked up while BACKUP: autoconf
+ * addresses, plus the kernel's RA-learned prefix and router lists. A prefix
+ * learned from an RA keeps its autonomous (A) flag even after the interface
+ * switches to tracking, and FreeBSD then detaches it (removing the LAN /64
+ * route) as soon as the WAN router is seen as reachable.
+ * Only called on MASTER, before WAN is configured, so the global flushes
+ * only hit stale LAN entries.
+ */
+function flush_slaac_state(string $ifname): void
+{
+    $output = [];
+    exec('/sbin/ifconfig ' . escapeshellarg($ifname) . ' inet6 2>&1', $output);
+    foreach ($output as $line) {
+        if (preg_match('/^\s*inet6\s+(\S+)\s.*\bautoconf\b/', $line, $m)) {
+            ifconfig($ifname, 'inet6 ' . escapeshellarg($m[1]) . ' -alias');
+        }
+    }
+    run_cmd('/usr/sbin/ndp -P');   // flush prefix list
+    run_cmd('/usr/sbin/ndp -R');   // flush default router list
+}
+
+/** Set a gateway's disabled flag. Returns true if the config changed. */
+function set_gateway_disabled(string $name, bool $disabled): bool
+{
+    global $config;
+
+    if (empty($config['OPNsense']['Gateways']['gateway_item'])) {
+        log_error("wancarp: no gateways in config, cannot find '{$name}'");
+        return false;
+    }
+
+    $items  = &$config['OPNsense']['Gateways']['gateway_item'];
+    $single = isset($items['name']);
+    if ($single) {
+        $items = [$items];
+    }
+
+    $want    = $disabled ? '1' : '0';
+    $found   = false;
+    $changed = false;
+    foreach ($items as $i => $gw) {
+        if (($gw['name'] ?? '') !== $name) {
+            continue;
+        }
+        $found = true;
+        if (($gw['disabled'] ?? '0') !== $want) {
+            $items[$i]['disabled'] = $want;
+            $changed = true;
+        }
+    }
+
+    if ($single) {
+        $items = $items[0];
+    }
+    if (!$found) {
+        log_error("wancarp: gateway '{$name}' not found");
+    }
+    return $changed;
+}
+
+/* ------------------------- validate arguments ------------------------- */
+
+$subsystem = $argv[1] ?? '';
+$type      = $argv[2] ?? '';
+
+if (!in_array($type, ['MASTER', 'BACKUP', 'INIT'], true)) {
+    log_error("wancarp: CARP event '{$type}' unknown from source '{$subsystem}'");
+    exit(1);
+}
+if (strpos($subsystem, '@') === false) {
+    log_error("wancarp: CARP event '{$type}' from unexpected source '{$subsystem}'");
+    exit(1);
+}
+
+// The hook runs for every VIP on the box; only follow the one on the LAN.
+[, $event_if] = explode('@', $subsystem, 2);
+if ($event_if !== LAN_IF) {
+    exit(0);
+}
+
+// CARP events can arrive in bursts; handle them one at a time, in order.
+$lock = fopen(LOCK_FILE, 'c');
+if ($lock === false || !flock($lock, LOCK_EX)) {
+    log_error("wancarp: could not acquire lock, skipping CARP event '{$type}'");
+    exit(1);
+}
+
+/* ------------------------------- act ---------------------------------- */
+
+$wan     = &$config['interfaces'][WAN_KEY];
+$lan     = &$config['interfaces'][LAN_KEY];
+$wan_on  = !empty($wan['enable']);
+$lan_v6  = $lan['ipaddrv6'] ?? '';
+$changes = [];   // collected so config.xml is written once per event
+
+if ($type === 'MASTER') {
+    if (set_gateway_disabled(LAN_GW6, true)) {
+        say('disabling floating IPv6 gateway ' . LAN_GW6);
+        $changes[] = 'disable ' . LAN_GW6;
+    }
+
+    if ($lan_v6 === 'slaac') {
+        say("switching '" . LAN_KEY . "' IPv6 to track '" . WAN_KEY . "'");
+        $lan['ipaddrv6']         = 'idassoc6';
+        $lan['track6-interface'] = WAN_KEY;
+        $lan['track6-prefix-id'] = '0';
+        $lan['track6_assoc_pd']  = '1';
+        ifconfig(LAN_IF, 'inet6 -accept_rtadv');
+        flush_slaac_state(LAN_IF);
+        $changes[] = LAN_KEY . ' IPv6 -> track ' . WAN_KEY;
+    }
+
+    if (!$wan_on) {
+        say("enabling '" . WAN_KEY . "'");
+        $wan['enable'] = '1';
+        usleep(500000);
+        ifconfig(WAN_IF, 'inet6 no_dad up');
+        $changes[] = 'enable ' . WAN_KEY;
+    }
+
+    if ($changes) {
+        write_config('CARP MASTER: ' . implode(', ', $changes), false);
+    }
+    if (!$wan_on) {
+        interface_configure(false, WAN_KEY, true, true, true);
+    }
+} else { // BACKUP or INIT
+    if ($wan_on) {
+        say("disabling '" . WAN_KEY . "'");
+        interface_reset(WAN_KEY);
+        unset($wan['enable']);
+        interface_configure(false, WAN_KEY, true, false, true);
+        ifconfig(WAN_IF, 'down');
+        run_cmd('/sbin/route flush -inet6');
+        remove_link_local(WAN_IF);
+        $changes[] = 'disable ' . WAN_KEY;
+    }
+
+    if ($lan_v6 === 'idassoc6') {
+        say("switching '" . LAN_KEY . "' IPv6 to SLAAC");
+        $lan['ipaddrv6'] = 'slaac';
+        unset(
+            $lan['track6-interface'],
+            $lan['track6-prefix-id'],
+            $lan['track6_prefix_range'],
+            $lan['track6_assoc_pd']
+        );
+        ifconfig(LAN_IF, 'inet6 accept_rtadv');
+        $changes[] = LAN_KEY . ' IPv6 -> SLAAC';
+    }
+
+    if (set_gateway_disabled(LAN_GW6, false)) {
+        say('enabling floating IPv6 gateway ' . LAN_GW6);
+        $changes[] = 'enable ' . LAN_GW6;
+    }
+
+    if ($changes) {
+        write_config("CARP {$type}: " . implode(', ', $changes), false);
+    }
+}
+
+// Re-evaluate routes whenever anything changed (also restores routes after the flush).
+if ($changes) {
+    run_cmd('/usr/local/sbin/configctl interface routes alarm');
+}
+
+flock($lock, LOCK_UN);
+fclose($lock);
+exit(0);
