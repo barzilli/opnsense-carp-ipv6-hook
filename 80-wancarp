@@ -42,6 +42,19 @@ function stamp(string $what): void
     say(sprintf('%s %s at %.6f', WAN_IF, $what, microtime(true)));
 }
 
+/** Current CARP state (MASTER, BACKUP, INIT) of a vhid on an interface, or '' if not found. */
+function carp_state(string $ifname, string $vhid): string
+{
+    $output = [];
+    exec('/sbin/ifconfig ' . escapeshellarg($ifname) . ' 2>&1', $output);
+    foreach ($output as $line) {
+        if (preg_match('/^\s*carp:\s+(\S+)\s+vhid\s+(\d+)\b/', $line, $m) && $m[2] === $vhid) {
+            return $m[1];
+        }
+    }
+    return '';
+}
+
 /** Run a shell command; log output if it fails. */
 function run_cmd(string $cmd): bool
 {
@@ -147,7 +160,7 @@ if (strpos($subsystem, '@') === false) {
 }
 
 // The hook runs for every VIP on the box; only follow the one on the LAN.
-[, $event_if] = explode('@', $subsystem, 2);
+[$event_vhid, $event_if] = explode('@', $subsystem, 2);
 if ($event_if !== LAN_IF) {
     exit(0);
 }
@@ -157,6 +170,18 @@ $lock = fopen(LOCK_FILE, 'c');
 if ($lock === false || !flock($lock, LOCK_EX)) {
     log_error("wancarp: could not acquire lock, skipping CARP event '{$type}'");
     exit(1);
+}
+
+// A burst (e.g. BACKUP -> MASTER -> BACKUP within a second) queues hooks on the
+// lock; by the time one runs, its event may be stale. Act on the state CARP is
+// in now, not the one the event reported, so WAN is never brought up on a node
+// that is no longer MASTER.
+$now = carp_state(LAN_IF, $event_vhid);
+if (($type === 'MASTER') !== ($now === 'MASTER')) {
+    say("skipping stale CARP event '{$type}', vhid {$event_vhid} is now '{$now}'");
+    flock($lock, LOCK_UN);
+    fclose($lock);
+    exit(0);
 }
 
 /* ------------------------------- act ---------------------------------- */
