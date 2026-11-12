@@ -23,6 +23,22 @@ The hook expects the pair to be set up as follows. Items 1 to 5 come from the te
 8. **LAN IPv6 set to track WAN (identity association) on the MASTER, and to SLAAC on the BACKUP.** The hook switches it at each transition.
 9. **The settings block matches each node:** `WAN_KEY`, `WAN_IF`, `LAN_KEY`, `LAN_IF`, `LAN_GW6`.
 
+## Tuning `WAN_UP_DELAY_US`
+
+Both nodes share one WAN MAC address, so the new MASTER must not bring vtnet1 up until the old MASTER's vtnet1 is down. The delay can't guarantee that, because it can't see the other node. It can only cover a gap you have measured. The BACKUP branch therefore takes vtnet1 down first, before the slower interface reset and reconfigure, and both transitions are logged with microsecond timestamps:
+
+```
+wancarp: vtnet1 down at 1762930000.123456   (old master)
+wancarp: vtnet1 up at 1762930000.734567     (new master)
+```
+
+To tune it:
+
+1. Keep both nodes NTP-synced.
+2. Run about 20 graceful failovers each way (CARP maintenance mode, a clean VM shutdown or reboot, and pulling the LAN link). A crash needs no tuning, because the old master's WAN is already gone.
+3. For each one, compute the margin as `up - down` from `grep wancarp /var/log/system/latest.log` on both nodes.
+4. The smallest margin you saw is slack. You can lower `WAN_UP_DELAY_US` by up to that much, but keep a safety margin of at least 100 ms for clock skew and load. If any margin is negative, the links overlapped, so raise the delay instead.
+
 ## Other ISPs
 
 The hook has only been tested with AT&T fiber, which delegates /64s out of a /60. The script itself doesn't depend on the ISP: it only switches WAN, LAN tracking and the floating gateways. What changes between ISPs is how their DHCPv6 server reacts when a second router takes over the same lease. Before relying on it with another ISP, check these, which are general guidance and not yet tested:

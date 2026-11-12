@@ -27,12 +27,19 @@ const LAN_KEY    = 'lan';      // interface carrying the CARP VIP
 const LAN_IF     = 'vtnet0';
 const LAN_GW6    = 'LAN_6';    // floating IPv6 gateway used while BACKUP
 const LOCK_FILE  = '/tmp/wancarp.lock';
+const WAN_UP_DELAY_US = 500000; // MASTER: wait before bringing WAN up, so the old master's WAN (same MAC) is down
 
 /* ------------------------------ helpers ------------------------------- */
 
 function say(string $msg): void
 {
     log_msg('wancarp: ' . $msg);
+}
+
+/** Log a WAN transition with a microsecond timestamp, for measuring the up/down gap across nodes. */
+function stamp(string $what): void
+{
+    say(sprintf('%s %s at %.6f', WAN_IF, $what, microtime(true)));
 }
 
 /** Run a shell command; log output if it fails. */
@@ -180,7 +187,8 @@ if ($type === 'MASTER') {
     if (!$wan_on) {
         say("enabling '" . WAN_KEY . "'");
         $wan['enable'] = '1';
-        usleep(500000);
+        usleep(WAN_UP_DELAY_US);
+        stamp('up');
         ifconfig(WAN_IF, 'inet6 no_dad up');
         $changes[] = 'enable ' . WAN_KEY;
     }
@@ -194,6 +202,10 @@ if ($type === 'MASTER') {
 } else { // BACKUP or INIT
     if ($wan_on) {
         say("disabling '" . WAN_KEY . "'");
+        // Take the shared-MAC link down before anything slow, to keep the
+        // overlap with the new master's WAN as short as possible.
+        stamp('down');
+        ifconfig(WAN_IF, 'down');
         interface_reset(WAN_KEY);
         unset($wan['enable']);
         interface_configure(false, WAN_KEY, true, false, true);
