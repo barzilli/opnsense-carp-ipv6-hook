@@ -33,7 +33,9 @@ wancarp: vtnet1 down at 1762930000.123456   (old master)
 wancarp: vtnet1 up at 1762930000.734567     (new master)
 ```
 
-To tune it:
+The default is 200 ms. In 13 measured failovers on the tested pair, the worst case was failback by preemption, where the old master took WAN down about 30 ms after the new master's hook started. Demotion (maintenance mode) and a LAN link pull showed no lag, and a stopped VM has no WAN to overlap.
+
+To re-tune it for your own hardware:
 
 1. Keep both nodes NTP-synced.
 2. Run about 20 graceful failovers each way (CARP maintenance mode, a clean VM shutdown or reboot, and pulling the LAN link). A crash needs no tuning, because the old master's WAN is already gone.
