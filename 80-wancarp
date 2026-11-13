@@ -166,8 +166,10 @@ if ($event_if !== LAN_IF) {
 }
 
 // CARP events can arrive in bursts; handle them one at a time, in order.
-// The lock is released when the process exits.
-$lock = fopen(LOCK_FILE, 'c');
+// Open the lock close-on-exec ('e'): interface_configure() starts daemons
+// (dhclient, dhcp6c, radvd) from this process, and a daemon that inherited the
+// descriptor would hold the lock for its whole life, blocking every later hook.
+$lock = fopen(LOCK_FILE, 'ce');
 if ($lock === false || !flock($lock, LOCK_EX)) {
     log_error("wancarp: could not acquire lock, skipping CARP event '{$type}'");
     exit(1);
@@ -267,4 +269,6 @@ if ($changes) {
     run_cmd('/usr/local/sbin/configctl interface routes alarm');
 }
 
+flock($lock, LOCK_UN);
+fclose($lock);
 exit(0);
