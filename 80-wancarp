@@ -9,6 +9,10 @@
  *   BACKUP / INIT  -> WAN down, LAN IPv6 back to SLAAC,
  *                     floating LAN IPv6 gateway enabled (default route via the master).
  *
+ * Both nodes share the WAN MAC, so the old master takes WAN down first thing
+ * and the new master waits WAN_UP_DELAY_US before bringing it up. Events are
+ * handled one at a time and only if they still match the current CARP state.
+ *
  * Install as /usr/local/etc/rc.syshook.d/carp/80-wancarp on both nodes (chmod +x).
  * Invoked by OPNsense as:  80-wancarp <vhid>@<ifname> <MASTER|BACKUP|INIT>
  */
@@ -21,18 +25,40 @@ require_once("util.inc");
 
 /* ------------------------------ settings ------------------------------ */
 
-const WAN_KEY    = 'wan';      // interface brought up/down
-const WAN_IF     = 'vtnet1';
-const LAN_KEY    = 'lan';      // interface carrying the CARP VIP
-const LAN_IF     = 'vtnet0';
-const LAN_GW6    = 'LAN_6';    // floating IPv6 gateway used while BACKUP
-const LOCK_FILE  = '/tmp/wancarp.lock';
+const WAN_KEY         = 'wan';      // interface brought up/down
+const WAN_IF          = 'vtnet1';
+const LAN_KEY         = 'lan';      // interface carrying the CARP VIP
+const LAN_IF          = 'vtnet0';
+const LAN_GW6         = 'LAN_6';    // floating IPv6 gateway used while BACKUP
+const LOCK_FILE       = '/tmp/wancarp.lock';
+// MASTER: wait before bringing WAN up, so the old master's WAN (same MAC) is
+// down. Measured worst case was ~30 ms (failback by preemption); see README.
+const WAN_UP_DELAY_US = 200000;
 
 /* ------------------------------ helpers ------------------------------- */
 
 function say(string $msg): void
 {
     log_msg('wancarp: ' . $msg);
+}
+
+/** Log a WAN transition with a microsecond timestamp, for measuring the up/down gap across nodes. */
+function stamp(string $what): void
+{
+    say(sprintf('%s %s at %.6f', WAN_IF, $what, microtime(true)));
+}
+
+/** Current CARP state (MASTER, BACKUP, INIT) of a vhid on an interface, or '' if not found. */
+function carp_state(string $ifname, string $vhid): string
+{
+    $output = [];
+    exec('/sbin/ifconfig ' . escapeshellarg($ifname) . ' 2>&1', $output);
+    foreach ($output as $line) {
+        if (preg_match('/^\s*carp:\s+(\S+)\s+vhid\s+(\d+)\b/', $line, $m) && $m[2] === $vhid) {
+            return $m[1];
+        }
+    }
+    return '';
 }
 
 /** Run a shell command; log output if it fails. */
@@ -52,13 +78,13 @@ function ifconfig(string $ifname, string $args): bool
     return run_cmd('/sbin/ifconfig ' . escapeshellarg($ifname) . ' ' . $args);
 }
 
-/** Remove every fe80:: address from an interface. */
-function remove_link_local(string $ifname): void
+/** Remove every IPv6 address on an interface whose ifconfig line matches $pattern (address in group 1). */
+function remove_inet6(string $ifname, string $pattern): void
 {
     $output = [];
     exec('/sbin/ifconfig ' . escapeshellarg($ifname) . ' inet6 2>&1', $output);
     foreach ($output as $line) {
-        if (preg_match('/^\s*inet6\s+(fe80:[0-9a-f:]*%\S+)/i', $line, $m)) {
+        if (preg_match($pattern, $line, $m)) {
             ifconfig($ifname, 'inet6 ' . escapeshellarg($m[1]) . ' -alias');
         }
     }
@@ -75,13 +101,7 @@ function remove_link_local(string $ifname): void
  */
 function flush_slaac_state(string $ifname): void
 {
-    $output = [];
-    exec('/sbin/ifconfig ' . escapeshellarg($ifname) . ' inet6 2>&1', $output);
-    foreach ($output as $line) {
-        if (preg_match('/^\s*inet6\s+(\S+)\s.*\bautoconf\b/', $line, $m)) {
-            ifconfig($ifname, 'inet6 ' . escapeshellarg($m[1]) . ' -alias');
-        }
-    }
+    remove_inet6($ifname, '/^\s*inet6\s+(\S+)\s.*\bautoconf\b/');
     run_cmd('/usr/sbin/ndp -P');   // flush prefix list
     run_cmd('/usr/sbin/ndp -R');   // flush default router list
 }
@@ -140,16 +160,29 @@ if (strpos($subsystem, '@') === false) {
 }
 
 // The hook runs for every VIP on the box; only follow the one on the LAN.
-[, $event_if] = explode('@', $subsystem, 2);
+[$event_vhid, $event_if] = explode('@', $subsystem, 2);
 if ($event_if !== LAN_IF) {
     exit(0);
 }
 
 // CARP events can arrive in bursts; handle them one at a time, in order.
-$lock = fopen(LOCK_FILE, 'c');
+// Open the lock close-on-exec ('e'): interface_configure() starts daemons
+// (dhclient, dhcp6c, radvd) from this process, and a daemon that inherited the
+// descriptor would hold the lock for its whole life, blocking every later hook.
+$lock = fopen(LOCK_FILE, 'ce');
 if ($lock === false || !flock($lock, LOCK_EX)) {
     log_error("wancarp: could not acquire lock, skipping CARP event '{$type}'");
     exit(1);
+}
+
+// A burst (e.g. BACKUP -> MASTER -> BACKUP within a second) queues hooks on the
+// lock; by the time one runs, its event may be stale. Act on the state CARP is
+// in now, not the one the event reported, so WAN is never brought up on a node
+// that is no longer MASTER.
+$now = carp_state(LAN_IF, $event_vhid);
+if (($type === 'MASTER') !== ($now === 'MASTER')) {
+    say("skipping stale CARP event '{$type}', vhid {$event_vhid} is now '{$now}'");
+    exit(0);
 }
 
 /* ------------------------------- act ---------------------------------- */
@@ -180,7 +213,8 @@ if ($type === 'MASTER') {
     if (!$wan_on) {
         say("enabling '" . WAN_KEY . "'");
         $wan['enable'] = '1';
-        usleep(500000);
+        usleep(WAN_UP_DELAY_US);
+        stamp('up');
         ifconfig(WAN_IF, 'inet6 no_dad up');
         $changes[] = 'enable ' . WAN_KEY;
     }
@@ -194,12 +228,16 @@ if ($type === 'MASTER') {
 } else { // BACKUP or INIT
     if ($wan_on) {
         say("disabling '" . WAN_KEY . "'");
+        // Take the shared-MAC link down before anything slow, to keep the
+        // overlap with the new master's WAN as short as possible.
+        stamp('down');
+        ifconfig(WAN_IF, 'down');
         interface_reset(WAN_KEY);
         unset($wan['enable']);
         interface_configure(false, WAN_KEY, true, false, true);
         ifconfig(WAN_IF, 'down');
         run_cmd('/sbin/route flush -inet6');
-        remove_link_local(WAN_IF);
+        remove_inet6(WAN_IF, '/^\s*inet6\s+(fe80:[0-9a-f:]*%\S+)/i');
         $changes[] = 'disable ' . WAN_KEY;
     }
 
