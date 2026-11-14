@@ -1,0 +1,32 @@
+#!/usr/local/bin/php
+<?php
+
+/*
+ * Early-boot companion to 80-wancarp.
+ *
+ * A node that was MASTER when it went down still has WAN enabled in
+ * config.xml, so on the next boot OPNsense would bring WAN up (same MAC and
+ * DUID as the peer) before CARP has decided who is MASTER. This hook runs
+ * before interfaces are configured and disables WAN in the config; the CARP
+ * MASTER event then enables it through 80-wancarp if this node wins.
+ * Covers clean reboots and crashes alike.
+ *
+ * Install as /usr/local/etc/rc.syshook.d/early/10-wancarp-boot on both nodes (chmod +x).
+ */
+
+require_once("config.inc");
+require_once("util.inc");
+
+const WAN_KEY = 'wan';   // must match WAN_KEY in 80-wancarp
+
+$wan = &$config['interfaces'][WAN_KEY];
+if (!empty($wan['enable'])) {
+    unset($wan['enable']);
+    write_config('wancarp: disable WAN at boot until CARP elects a MASTER', false);
+    // syslog isn't running yet this early, so log_msg() is lost; console
+    // output is captured in the boot log instead.
+    echo 'wancarp: boot: disabled ' . WAN_KEY . " until CARP elects a MASTER\n";
+} else {
+    echo 'wancarp: boot: ' . WAN_KEY . " already disabled\n";
+}
+exit(0);
