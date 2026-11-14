@@ -9,6 +9,8 @@
 
 Copy the script to `/usr/local/etc/rc.syshook.d/carp/80-wancarp` on both nodes and run `chmod +x` on it. Check the settings block at the top first (interface keys and device names, and the floating gateway name).
 
+Also copy `10-wancarp-boot` to `/usr/local/etc/rc.syshook.d/early/10-wancarp-boot` on both nodes and run `chmod +x` on it. A node that was MASTER when it went down still has WAN enabled in its saved config, so without this hook it brings WAN up at boot, with the same MAC and DUID as the peer, before CARP has picked a MASTER. The early hook disables WAN in the config before interfaces are configured, and 80-wancarp enables it again if this node becomes MASTER. If the peer is down, WAN comes up a few seconds later than it otherwise would, once CARP's master timeout expires.
+
 ## Firewall prerequisites
 
 The hook expects the pair to be set up as follows. Items 1 to 6 come from the tested deployment. Items 7 to 10 follow from what the script itself does.
