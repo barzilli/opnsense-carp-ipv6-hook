@@ -32,7 +32,7 @@ const LAN_IF          = 'vtnet0';
 const LAN_GW6         = 'LAN_6';    // floating IPv6 gateway used while BACKUP
 const LOCK_FILE       = '/tmp/wancarp.lock';
 // MASTER: wait before bringing WAN up, so the old master's WAN (same MAC) is
-// down. Measured worst case was ~30 ms (failback by preemption); see README.
+// down. Measured worst case was ~55 ms (failback by preemption); see README.
 const WAN_UP_DELAY_US = 200000;
 
 /* ------------------------------ helpers ------------------------------- */

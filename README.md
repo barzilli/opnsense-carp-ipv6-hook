@@ -33,7 +33,7 @@ wancarp: vtnet1 down at 1762930000.123456   (old master)
 wancarp: vtnet1 up at 1762930000.734567     (new master)
 ```
 
-The default is 200 ms. In 13 measured failovers on the tested pair, the worst case was failback by preemption, where the old master took WAN down about 30 ms after the new master's hook started. Demotion (maintenance mode) and a LAN link pull showed no lag, and a stopped VM has no WAN to overlap.
+The default is 200 ms. Across 26 measured failovers on the tested pair (16 demotion cycles, 3 LAN link pulls and reboots), the worst case was failback by preemption, where the old master took WAN down about 55 ms after the new master's hook started, leaving a 147 ms margin. A LAN link pull left a margin of 1.8 s or more, and a stopped VM has no WAN to overlap.
 
 To re-tune it for your own hardware:
 
