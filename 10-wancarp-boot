@@ -23,6 +23,10 @@ $wan = &$config['interfaces'][WAN_KEY];
 if (!empty($wan['enable'])) {
     unset($wan['enable']);
     write_config('wancarp: disable WAN at boot until CARP elects a MASTER', false);
-    log_msg('wancarp: boot: disabled ' . WAN_KEY . ' until CARP elects a MASTER');
+    // syslog isn't running yet this early, so log_msg() is lost; console
+    // output is captured in the boot log instead.
+    echo 'wancarp: boot: disabled ' . WAN_KEY . " until CARP elects a MASTER\n";
+} else {
+    echo 'wancarp: boot: ' . WAN_KEY . " already disabled\n";
 }
 exit(0);
